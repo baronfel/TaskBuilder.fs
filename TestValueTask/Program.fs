@@ -1,4 +1,5 @@
-﻿/// ValueTask tests for TaskBuilder.fs
+﻿module TestValueTasks
+/// ValueTask tests for TaskBuilder.fs
 //
 // Written in 2017 by Robert Peele (humbobst@gmail.com)
 //
@@ -17,7 +18,7 @@ open System.Threading.Tasks
 open FSharp.Control.Tasks.ContextInsensitive
 
 type IValueTaskInterface =
-    abstract member TypedTask : 'a -> 'a ValueTask
+    abstract member TypedTask : 'a -> ValueTask<'a>
 
 let exampleValueTaskBinder (iface : IValueTaskInterface) =
     task {
@@ -33,7 +34,7 @@ let exampleValueTaskBinder (iface : IValueTaskInterface) =
 let main argv =
     let iface =
         { new IValueTaskInterface with
-            member this.TypedTask(x) = ValueTask(x)
+            member this.TypedTask(x) = ValueTask<_>(x)
         }
     let result = (exampleValueTaskBinder iface).Result
     printfn "%A" result

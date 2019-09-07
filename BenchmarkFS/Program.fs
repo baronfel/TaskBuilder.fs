@@ -1,4 +1,6 @@
-﻿open FSharp.Control.Tasks
+﻿module BenchmarkFS.Program
+
+open FSharp.Control.Tasks
 open System.Diagnostics
 open System.Threading.Tasks
 open System.IO

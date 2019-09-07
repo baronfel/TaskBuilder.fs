@@ -1,4 +1,6 @@
-﻿// Tests for TaskBuilder.fs
+﻿module Test
+
+// Tests for TaskBuilder.fs
 //
 // Written in 2016 by Robert Peele (humbobst@gmail.com)
 //

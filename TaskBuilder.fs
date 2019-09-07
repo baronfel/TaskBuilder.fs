@@ -11,6 +11,7 @@
 
 namespace FSharp.Control.Tasks
 open System
+open System.Threading
 open System.Threading.Tasks
 open System.Runtime.CompilerServices
 
@@ -27,6 +28,8 @@ module TaskBuilder =
         | Return of 'a
         /// We model tail calls explicitly, but still can't run them without O(n) memory usage.
         | ReturnFrom of 'a Task
+        | Cancel of tok: CancellationToken
+
     /// Implements the machinery of running a `Step<'m, 'm>` as a task returning a continuation task.
     and StepStateMachine<'a>(firstStep) as this =
         let methodBuilder = AsyncTaskMethodBuilder<'a Task>()
@@ -45,6 +48,9 @@ module TaskBuilder =
                 | Await (await, next) ->
                     continuation <- next
                     await
+                | Cancel ctok -> 
+                    methodBuilder.SetResult(Task.FromCanceled<_> ctok)
+                    null
             with
             | exn ->
                 methodBuilder.SetException(exn)
@@ -133,51 +139,69 @@ module TaskBuilder =
     /// Chains together a step with its following step.
     /// Note that this requires that the first step has no result.
     /// This prevents constructs like `task { return 1; return 2; }`.
-    let rec combine (step : Step<unit>) (continuation : unit -> Step<'b>) =
+    let rec combine (step : Step<unit>) (continuation : unit -> Step<'b>) (ctok: CancellationToken) =
         match step with
-        | Return _ -> continuation()
+        | Return _ -> 
+            if ctok.IsCancellationRequested then Cancel ctok
+            else continuation()
         | ReturnFrom t ->
-            Await (t.GetAwaiter(), continuation)
+            let next () = if ctok.IsCancellationRequested then Cancel ctok else continuation()
+            Await (t.GetAwaiter(), next)
         | Await (awaitable, next) ->
-            Await (awaitable, fun () -> combine (next()) continuation)
+            let next' () = if ctok.IsCancellationRequested then Cancel ctok else next ()
+            Await (awaitable, fun () -> combine (next'()) continuation ctok)
+        | Cancel ctok -> Cancel ctok
 
     /// Builds a step that executes the body while the condition predicate is true.
-    let whileLoop (cond : unit -> bool) (body : unit -> Step<unit>) =
+    let whileLoop (cond : unit -> bool) (body : unit -> Step<unit>) (ctok: CancellationToken) =
         if cond() then
             // Create a self-referencing closure to test whether to repeat the loop on future iterations.
             let rec repeat () =
-                if cond() then
-                    let body = body()
-                    match body with
-                    | Return _ -> repeat()
-                    | ReturnFrom t -> Await(t.GetAwaiter(), repeat)
-                    | Await (awaitable, next) ->
-                        Await (awaitable, fun () -> combine (next()) repeat)
-                else zero
+                if ctok.IsCancellationRequested then Cancel ctok
+                else 
+                    if cond() then
+                        let body = body()
+                        match body with
+                        | Return _ -> repeat ()
+                        | ReturnFrom t -> Await(t.GetAwaiter(), repeat)
+                        | Await (awaitable, next) ->
+                            let nextStep () =
+                                if ctok.IsCancellationRequested 
+                                then Cancel ctok 
+                                else next()
+                            Await (awaitable, fun () -> combine (nextStep()) repeat ctok)
+                        | Cancel ctok -> Cancel ctok
+                    else zero
             // Run the body the first time and chain it to the repeat logic.
-            combine (body()) repeat
+            combine (body()) repeat ctok
         else zero
 
     /// Wraps a step in a try/with. This catches exceptions both in the evaluation of the function
     /// to retrieve the step, and in the continuation of the step (if any).
-    let rec tryWith(step : unit -> Step<'a>) (catch : exn -> Step<'a>) =
+    let rec tryWith (step : unit -> Step<'a>) (catch : exn -> Step<'a>) (ctok: CancellationToken) =
         try
             match step() with
             | Return _ as i -> i
             | ReturnFrom t ->
-                let awaitable = t.GetAwaiter()
-                Await(awaitable, fun () ->
-                    try
-                        awaitable.GetResult() |> Return
-                    with
-                    | exn -> catch exn)
-            | Await (awaitable, next) -> Await (awaitable, fun () -> tryWith next catch)
+                if ctok.IsCancellationRequested
+                then Cancel ctok
+                else
+                    let awaitable = t.GetAwaiter()
+                    Await(awaitable, fun () ->
+                        try
+                            if ctok.IsCancellationRequested
+                            then Cancel ctok
+                            else awaitable.GetResult() |> Return
+                        with
+                        | exn -> catch exn)
+            | Await (awaitable, next) -> Await (awaitable, fun () -> tryWith next catch ctok)
+            | Cancel ctok -> Cancel ctok
         with
         | exn -> catch exn
 
     /// Wraps a step in a try/finally. This catches exceptions both in the evaluation of the function
     /// to retrieve the step, and in the continuation of the step (if any).
-    let rec tryFinally (step : unit -> Step<'a>) fin =
+    let rec tryFinally (step : unit -> Step<'a>) fin (ctok: CancellationToken) =
         let step =
             try step()
             // Important point: we use a try/with, not a try/finally, to implement tryFinally.
@@ -192,41 +216,61 @@ module TaskBuilder =
             fin()
             i
         | ReturnFrom t ->
+            let next (awaitable: TaskAwaiter<'a>) = 
+                if ctok.IsCancellationRequested
+                then 
+                    fin ()
+                    Cancel ctok
+                else 
+                    let result =
+                        try
+                            if ctok.IsCancellationRequested
+                            then Cancel ctok
+                            else awaitable.GetResult() |> Return
+                        with
+                        | _ ->
+                            fin()
+                            reraise()
+                    fin() // if we got here we haven't run fin(), because we would've reraised after doing so
+                    result
             let awaitable = t.GetAwaiter()
-            Await(awaitable, fun () ->
-                let result =
-                    try
-                        awaitable.GetResult() |> Return
-                    with
-                    | _ ->
-                        fin()
-                        reraise()
-                fin() // if we got here we haven't run fin(), because we would've reraised after doing so
-                result)
+            Await(awaitable, fun () -> next awaitable)
         | Await (awaitable, next) ->
-            Await (awaitable, fun () -> tryFinally next fin)
+            Await (awaitable, fun () -> tryFinally next fin ctok)
+        | Cancel ctok -> Cancel ctok
 
     /// Implements a using statement that disposes `disp` after `body` has completed.
-    let using (disp : #IDisposable) (body : _ -> Step<'a>) =
+    let using (disp : #IDisposable) (body : _ -> Step<'a>) ctok =
         // A using statement is just a try/finally with the finally block disposing if non-null.
         tryFinally
             (fun () -> body disp)
-            (fun () -> if not (isNull (box disp)) then disp.Dispose())
+            (fun () -> if not (isNull (box disp)) then disp.Dispose()) ctok
 
     /// Implements a loop that runs `body` for each element in `sequence`.
-    let forLoop (sequence : 'a seq) (body : 'a -> Step<unit>) =
+    let forLoop (sequence : 'a seq) (body : 'a -> Step<unit>) ctok =
         // A for loop is just a using statement on the sequence's enumerator...
         using (sequence.GetEnumerator())
             // ... and its body is a while loop that advances the enumerator and runs the body on each element.
-            (fun e -> whileLoop e.MoveNext (fun () -> body e.Current))
+            (fun e -> whileLoop e.MoveNext (fun () -> body e.Current) ctok) ctok
 
     /// Runs a step as a task -- with a short-circuit for immediately completed steps.
-    let run (firstStep : unit -> Step<'a>) =
+    let run (firstStep : unit -> Step<'a>) (ctok: CancellationToken) =
         try
             match firstStep() with
             | Return x -> Task.FromResult(x)
             | ReturnFrom t -> t
-            | Await _ as step -> StepStateMachine<'a>(step).Run().Unwrap() // sadly can't do tail recursion
+            | Await _ as step ->
+                if ctok.IsCancellationRequested 
+                then 
+                    let cts = new TaskCompletionSource<_>(ctok)
+                    cts.SetCanceled ()
+                    cts.Task
+                else
+                    StepStateMachine<'a>(step).Run().Unwrap() // sadly can't do tail recursion
+            | Cancel ctok -> 
+                let cts = new TaskCompletionSource<_>(ctok)
+                cts.SetCanceled ()
+                cts.Task
         // Any exceptions should go on the task, rather than being thrown from this call.
         // This matches C# behavior where you won't see an exception until awaiting the task,
         // even if it failed before reaching the first "await".
@@ -263,34 +307,36 @@ module TaskBuilder =
         static member        ($) (  Priority1, a   : 'a Async      ) = bindTaskConfigureFalse (Async.StartAsTask a) ret
 
     // New style task builder.
-    type TaskBuilderV2() =
+    type TaskBuilderV2(ctok: CancellationToken) =
         // These methods are consistent between all builders.
         member __.Delay(f : unit -> Step<_>) = f
-        member __.Run(f : unit -> Step<'m>) = run f
+        member __.Run(f : unit -> Step<'m>) = run f ctok
         member __.Zero() = zero
         member __.Return(x) = ret x
-        member __.Combine(step : unit Step, continuation) = combine step continuation
-        member __.While(condition : unit -> bool, body : unit -> unit Step) = whileLoop condition body
-        member __.For(sequence : _ seq, body : _ -> unit Step) = forLoop sequence body
-        member __.TryWith(body : unit -> _ Step, catch : exn -> _ Step) = tryWith body catch
-        member __.TryFinally(body : unit -> _ Step, fin : unit -> unit) = tryFinally body fin
-        member __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using disp body
+        member __.Combine(step : unit Step, continuation) = combine step continuation ctok
+        member __.While(condition : unit -> bool, body : unit -> unit Step) = whileLoop condition body ctok
+        member __.For(sequence : _ seq, body : _ -> unit Step) = forLoop sequence body ctok
+        member __.TryWith(body : unit -> _ Step, catch : exn -> _ Step) = tryWith body catch ctok
+        member __.TryFinally(body : unit -> _ Step, fin : unit -> unit) = tryFinally body fin ctok
+        member __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using disp body ctok
         member __.ReturnFrom a : _ Step = ReturnFrom a
+        [<CustomOperation("cancellationToken", MaintainsVariableSpace = true)>]
+        member __.CancellationToken () = ctok
 
     // Old style task builder. Retained for binary compatibility.
     type TaskBuilder() =
         // These methods are consistent between the two builders.
         // Unfortunately, inline members do not work with inheritance.
         member inline __.Delay(f : unit -> Step<_>) = f
-        member inline __.Run(f : unit -> Step<'m>) = run f
+        member inline __.Run(f : unit -> Step<'m>) = run f CancellationToken.None
         member inline __.Zero() = zero
         member inline __.Return(x) = ret x
-        member inline __.Combine(step : unit Step, continuation) = combine step continuation
-        member inline __.While(condition : unit -> bool, body : unit -> unit Step) = whileLoop condition body
-        member inline __.For(sequence : _ seq, body : _ -> unit Step) = forLoop sequence body
-        member inline __.TryWith(body : unit -> _ Step, catch : exn -> _ Step) = tryWith body catch
-        member inline __.TryFinally(body : unit -> _ Step, fin : unit -> unit) = tryFinally body fin
-        member inline __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using disp body
+        member inline __.Combine(step : unit Step, continuation) = combine step continuation CancellationToken.None
+        member inline __.While(condition : unit -> bool, body : unit -> unit Step) = whileLoop condition body CancellationToken.None
+        member inline __.For(sequence : _ seq, body : _ -> unit Step) = forLoop sequence body CancellationToken.None
+        member inline __.TryWith(body : unit -> _ Step, catch : exn -> _ Step) = tryWith body catch CancellationToken.None
+        member inline __.TryFinally(body : unit -> _ Step, fin : unit -> unit) = tryFinally body fin CancellationToken.None
+        member inline __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using disp body CancellationToken.None
         // End of consistent methods -- the following methods are different between
         // `TaskBuilder` and `ContextInsensitiveTaskBuilder`!
 
@@ -305,15 +351,15 @@ module TaskBuilder =
         // These methods are consistent between the two builders.
         // Unfortunately, inline members do not work with inheritance.
         member inline __.Delay(f : unit -> Step<_>) = f
-        member inline __.Run(f : unit -> Step<'m>) = run f
+        member inline __.Run(f : unit -> Step<'m>) = run f CancellationToken.None
         member inline __.Zero() = zero
         member inline __.Return(x) = ret x
-        member inline __.Combine(step : unit Step, continuation) = combine step continuation
-        member inline __.While(condition : unit -> bool, body : unit -> unit Step) = whileLoop condition body
-        member inline __.For(sequence : _ seq, body : _ -> unit Step) = forLoop sequence body
-        member inline __.TryWith(body : unit -> _ Step, catch : exn -> _ Step) = tryWith body catch
-        member inline __.TryFinally(body : unit -> _ Step, fin : unit -> unit) = tryFinally body fin
-        member inline __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using disp body
+        member inline __.Combine(step : unit Step, continuation) = combine step continuation CancellationToken.None
+        member inline __.While(condition : unit -> bool, body : unit -> unit Step) = whileLoop condition body CancellationToken.None
+        member inline __.For(sequence : _ seq, body : _ -> unit Step) = forLoop sequence body CancellationToken.None
+        member inline __.TryWith(body : unit -> _ Step, catch : exn -> _ Step) = tryWith body catch CancellationToken.None
+        member inline __.TryFinally(body : unit -> _ Step, fin : unit -> unit) = tryFinally body fin CancellationToken.None
+        member inline __.Using(disp : #IDisposable, body : #IDisposable -> _ Step) = using disp body CancellationToken.None
         // End of consistent methods -- the following methods are different between
         // `TaskBuilder` and `ContextInsensitiveTaskBuilder`!
 
@@ -390,7 +436,9 @@ module V2 =
 
         /// Builds a `System.Threading.Tasks.Task<'a>` similarly to a C# async/await method.
         /// Use this like `task { let! taskResult = someTask(); return taskResult.ToString(); }`.
-        let task = TaskBuilderV2()
+        let task = TaskBuilderV2(System.Threading.CancellationToken.None)
+        
+        let taskC ctok = TaskBuilderV2 ctok
 
         [<Obsolete("It is no longer necessary to wrap untyped System.Thread.Tasks.Task objects with \"unitTask\".")>]
         let unitTask (t : Task) = t
@@ -406,7 +454,9 @@ module V2 =
         /// all awaited tasks automatically configured *not* to resume on the captured context.
         /// This is often preferable when writing library code that is not context-aware, but undesirable when writing
         /// e.g. code that must interact with user interface controls on the same thread as its caller.
-        let task = TaskBuilderV2()
+        let task = TaskBuilderV2(System.Threading.CancellationToken.None)
+        
+        let taskC ctok = TaskBuilderV2 ctok
 
         [<Obsolete("It is no longer necessary to wrap untyped System.Thread.Tasks.Task objects with \"unitTask\".")>]
         let unitTask (t : Task) = t.ConfigureAwait(false)
