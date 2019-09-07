@@ -687,6 +687,35 @@ let testCompilerInfersArgumentOfReturnFrom =
         else return! failwith ""
     }
 
+// module to allow opening of submodule for some bind-member visibility
+module Foo = 
+    open FSharp.Control.Tasks.V2.ContextInsensitive
+
+    let testCancellation () = 
+        let cts = new CancellationTokenSource()
+        let tok = cts.Token
+
+        let thing1 = taskC tok {
+            do! Task.Delay(TimeSpan.FromSeconds 1.)
+            return 1
+        }
+        require (1 = thing1.Result) "when token is not cancelled execution works"
+
+        cts.Cancel()
+
+        let thing2 = taskC tok {
+            do! Task.Delay(TimeSpan.FromSeconds 1.)
+            return 1
+        }
+
+        require thing2.IsCanceled "task should be in cancelled state"
+
+        try 
+            thing2.Result |> ignore
+            require false "should have failed to get Result due to cancelled token"
+        with
+        | :? AggregateException as e -> require (e.InnerExceptions.[0].GetType() = typeof<TaskCanceledException>) "cause of thrown exception should be cancellation"
+
 [<EntryPoint>]
 let main argv =
     printfn "Running tests..."
@@ -723,6 +752,7 @@ let main argv =
         testTryFinallyOverReturnFromWithoutException()
         testCompatibilityWithOldUnitTask()
         testAsyncsMixedWithTasks()
+        Foo.testCancellation()
         printfn "Passed all tests!"
     with
     | exn ->
